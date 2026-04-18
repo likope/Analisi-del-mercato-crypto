@@ -98,4 +98,3 @@ def zeta_T(v, r, T, sigma):
     # Assemblaggio
     zeta = fase * (num / den)
     return zeta
-
