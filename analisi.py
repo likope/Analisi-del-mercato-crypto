@@ -1,5 +1,12 @@
 import polars as pl
-import numpy as np
+import csv
+import os
+from datetime import datetime
+from fetcher import get_binance_spot, fetch_option, fetch_cvd_spot
+
+_MAX_HISTORY = 500
+_OI_CHANGE_THRESHOLD_PCT = 0.001  # segnala solo cambi OI > 0.1%
+
 
 def netgex(df, spot: float):
     df = df.with_columns(
@@ -8,16 +15,16 @@ def netgex(df, spot: float):
         .otherwise(pl.lit(1))
         .alias("segno")
     ).with_columns(
-        (pl.col("oi")*pl.col("gamma")*pl.col("segno")*0.01*spot**2).alias("Net gex")
+        # gamma Deribit è normalizzato per 1% di mossa; 0.01*spot² converte in esposizione dollari
+        (pl.col("oi") * pl.col("gamma") * pl.col("segno") * 0.01 * spot**2).alias("Net gex")
     )
     Net_gex = df["Net gex"].sum()
-    return df, Net_gex
+    oi_totale = df["oi"].sum()
+    return df, Net_gex, oi_totale
 
 
 def walls(df, spot):
-    """
-    Analisi degli oi, net gex e degli wall.
-    """
+    df2 = df.clone()
     df = (
         df.group_by("strike")
         .agg([
@@ -25,76 +32,172 @@ def walls(df, spot):
             pl.col("Net gex").filter(pl.col("type") == "put").sum().alias("gex puts"),
             pl.col("oi").filter(pl.col("type") == "call").sum().alias("oi_calls"),
             pl.col("oi").filter(pl.col("type") == "put").sum().alias("oi_puts"),
-            (pl.col("oi") * pl.col("gamma"))
-              .filter(pl.col("type") == "call").sum()
-              .alias("weight call"),
-            (pl.col("oi") * pl.col("gamma"))
-              .filter(pl.col("type") == "put").sum()
-              .alias("weight put"),
+            (pl.col("oi") * pl.col("gamma")).filter(pl.col("type") == "call").sum().alias("weight call"),
+            (pl.col("oi") * pl.col("gamma")).filter(pl.col("type") == "put").sum().alias("weight put"),
         ])
     )
-    call_walls = (
-        df.filter(pl.col("strike") > spot)
-        .sort("weight call", descending = True)
-        .head(3)
+    oi_calls = df["oi_calls"].sum()
+    oi_puts = df["oi_puts"].sum()
+
+    df_oi = (
+        df2.group_by("strike")
+        .agg([
+            pl.col("oi").filter(pl.col("type") == "call").sum().alias("oi_calls"),
+            pl.col("oi").filter(pl.col("type") == "put").sum().alias("oi_puts"),
+        ])
+        .with_columns((pl.col("oi_calls") + pl.col("oi_puts")).alias("oi_total"))
+        .sort("oi_total", descending=True)
     )
 
-    put_walls = (
-        df.filter(pl.col("strike") < spot)
-        .sort("weight put", descending = True)
-        .head(3)
+    call_walls = df.filter(pl.col("strike") > spot).sort("weight call", descending=True).head(3)
+    put_walls = df.filter(pl.col("strike") < spot).sort("weight put", descending=True).head(3)
+    return df, call_walls, put_walls, oi_calls, oi_puts, df_oi
+
+
+def iv_skew(df):
+    """25-delta skew: differenza IV tra OTM puts e OTM calls come misura del sentiment di mercato."""
+    puts_25d = df.filter(
+        (pl.col("type") == "put") &
+        (pl.col("delta") >= -0.30) &
+        (pl.col("delta") <= -0.20)
     )
-    return df, call_walls, put_walls
+    calls_25d = df.filter(
+        (pl.col("type") == "call") &
+        (pl.col("delta") >= 0.20) &
+        (pl.col("delta") <= 0.30)
+    )
+    if len(puts_25d) == 0 or len(calls_25d) == 0:
+        return None, None, None, "dati insufficienti per il 25-delta"
+
+    iv_p = puts_25d["iv"].mean()
+    iv_c = calls_25d["iv"].mean()
+    skew = iv_p - iv_c
+
+    if skew > 5:
+        signal = "put premium (mercato difensivo)"
+    elif skew < -5:
+        signal = "call premium (mercato esuberante)"
+    else:
+        signal = "neutro"
+
+    return round(skew, 2), round(iv_p, 2), round(iv_c, 2), signal
 
 
-import numpy as np
-
-def griglia_carr_madan(N: int, A: float) -> tuple:
-    """
-    Costruisce griglia di nodi in v (dominio Fourier) e k (log-strike).
-
-    Args:
-        N: numero di nodi (potenza di 2)
-        A: upper bound dominio v
-
-    Returns:
-        v: array nodi in dominio Fourier
-        k: array nodi log-strike (centrati su 0)
-        eta: passo in v
-        lambda_: passo in k
-    """
-    eta = A / N                          # passo in v
-    lambda_ = 2 * np.pi / (N * eta)      # passo in k, da condizione Nyquist
-
-    v = eta * np.arange(N)               # v[j] = eta*j, j=0,...,N-1
-    k = -lambda_ * N / 2 + lambda_ * np.arange(N)   # k[l] centrato su 0
-
-    return v, k, eta, lambda_
+def _get_atm_iv(df, spot):
+    """IV media call+put allo strike più vicino allo spot."""
+    atm_strike = (
+        df.with_columns((pl.col("strike") - spot).abs().alias("dist"))
+        .sort("dist")["strike"][0]
+    )
+    atm_iv = df.filter(pl.col("strike") == atm_strike)["iv"].mean()
+    return round(atm_iv, 2)
 
 
-def cf_bs(y, sigma, T):
-    """
-    Characteristic function BS (detrendizzata).
-    φ(y) = exp(-σ²/2 · iy T - σ²y²T/2)
-    """
-    phi = np.exp(-sigma**2 / 2 * 1j * y * T - sigma**2 * y**2 * T / 2)
-    return phi
+def cvd_spot(symbol: str = "ETHUSDT", interval: str = "1m", limit: int = 100):
+    df = fetch_cvd_spot(symbol, interval, limit)
+    cvd_current = df["cvd"][-1]
+    signal = "BUY pressure" if cvd_current > 0 else "SELL pressure"
+    return df, cvd_current, signal
 
 
-def zeta_T(v, r, T, sigma):
-    # Fix v=0
-    v = v.copy()
-    v[0] = 1e-22
-    
-    # Pezzo 1: fase
-    fase = np.exp(1j * v * r * T)
-    
-    # Pezzo 2: numeratore
-    num = cf_bs(v - 1j, sigma, T) - 1
-    
-    # Pezzo 3: denominatore
-    den = 1j * v * (1 + 1j * v)
-    
-    # Assemblaggio
-    zeta = fase * (num / den)
-    return zeta
+def _save_session_row(path: str, row: dict):
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def ciclo(currency, expiry, spot_accumulo, oi_totale, currency_binance,
+          oi_calls_totale, oi_puts_totale, oi_history, cvd_history, timestamps,
+          iv_skew_history, atm_iv_history, cvd_interval="1m", cvd_limit=100):
+    cycle_num = len(spot_accumulo) + 1
+    print(f"\n--- Ciclo {cycle_num} [{datetime.now().strftime('%H:%M:%S')}] ---")
+
+    spot = get_binance_spot(currency_binance)
+    spot_accumulo.append(spot)
+    timestamps.append(datetime.now())
+    print(f"Spot: {spot:.2f}")
+
+    df = fetch_option(expiry, currency)
+    df, Netgex, oi_totale_current = netgex(df, spot)
+
+    if len(spot_accumulo) > 1:
+        delta_spot = spot_accumulo[-1] - spot_accumulo[-2]
+        if abs(delta_spot) > 2:
+            print(f"  *** Movimento forte: delta_spot = {delta_spot:+.2f}")
+
+    oi_totale.append(oi_totale_current)
+    if len(oi_totale) > 1 and oi_totale[-2] > 0:
+        delta_oi = oi_totale[-1] - oi_totale[-2]
+        pct = abs(delta_oi) / oi_totale[-2]
+        if pct > _OI_CHANGE_THRESHOLD_PCT:
+            print(f"  Cambio OI: {delta_oi:+.0f} ({pct * 100:.2f}%)")
+
+    gex_label = "short gamma" if Netgex > 0 else "long gamma"
+    print(f"OI totale: {oi_totale_current:.0f}")
+    print(f"Netgex: {Netgex:.2f} ({gex_label})")
+
+    # iv_skew e atm_iv vanno calcolati prima di walls() che aggrega df per strike
+    skew, iv_put, iv_call, skew_signal = iv_skew(df)
+    iv_skew_history.append(skew)
+    if skew is not None:
+        print(f"IV Skew 25d: {skew:+.2f} (put {iv_put:.1f}% / call {iv_call:.1f}%) → {skew_signal}")
+    else:
+        print(f"IV Skew: {skew_signal}")
+
+    atm_iv = _get_atm_iv(df, spot)
+    atm_iv_history.append(atm_iv)
+    print(f"ATM IV: {atm_iv:.1f}%")
+
+    df, call_walls, put_walls, oi_calls, oi_puts, df_oi = walls(df, spot)
+    oi_history.append(df_oi)
+    oi_calls_totale.append(oi_calls)
+    oi_puts_totale.append(oi_puts)
+
+    put_call_ratio = oi_puts / oi_calls if oi_calls > 0 else None
+    ratio_str = f"{put_call_ratio:.2f}" if put_call_ratio is not None else "N/A"
+    print(f"Put/Call ratio: {ratio_str}")
+
+    df_cvd, cvd_current, cvd_signal = cvd_spot(currency_binance, cvd_interval, cvd_limit)
+    cvd_history.append(df_cvd)
+    print(f"CVD spot: {cvd_current:.2f} ({cvd_signal})")
+
+    print(f"Call walls: {call_walls['strike'].to_list()}")
+    print(f"Put walls:  {put_walls['strike'].to_list()}")
+
+    _save_session_row("session_log.csv", {
+        "timestamp": timestamps[-1].isoformat(),
+        "cycle": cycle_num,
+        "spot": spot,
+        "netgex": round(Netgex, 4),
+        "iv_skew": skew if skew is not None else "",
+        "iv_put_25d": iv_put if iv_put is not None else "",
+        "iv_call_25d": iv_call if iv_call is not None else "",
+        "atm_iv": atm_iv,
+        "cvd": round(float(cvd_current), 4),
+        "put_call_ratio": round(put_call_ratio, 4) if put_call_ratio is not None else "",
+        "call_wall_1": call_walls["strike"][0] if len(call_walls) > 0 else "",
+        "call_wall_2": call_walls["strike"][1] if len(call_walls) > 1 else "",
+        "call_wall_3": call_walls["strike"][2] if len(call_walls) > 2 else "",
+        "put_wall_1": put_walls["strike"][0] if len(put_walls) > 0 else "",
+        "put_wall_2": put_walls["strike"][1] if len(put_walls) > 1 else "",
+        "put_wall_3": put_walls["strike"][2] if len(put_walls) > 2 else "",
+        "oi_total": round(oi_totale_current, 0),
+    })
+
+    # Cap su tutte le liste per evitare crescita illimitata in sessioni lunghe
+    spot_accumulo = spot_accumulo[-_MAX_HISTORY:]
+    timestamps = timestamps[-_MAX_HISTORY:]
+    oi_totale = oi_totale[-_MAX_HISTORY:]
+    oi_calls_totale = oi_calls_totale[-_MAX_HISTORY:]
+    oi_puts_totale = oi_puts_totale[-_MAX_HISTORY:]
+    iv_skew_history = iv_skew_history[-_MAX_HISTORY:]
+    atm_iv_history = atm_iv_history[-_MAX_HISTORY:]
+    oi_history = oi_history[-_MAX_HISTORY:]
+    cvd_history = cvd_history[-_MAX_HISTORY:]
+
+    return (spot_accumulo, call_walls, put_walls, spot, Netgex, oi_totale_current,
+            oi_totale, oi_calls_totale, oi_puts_totale, oi_history, cvd_history,
+            timestamps, iv_skew_history, atm_iv_history)
