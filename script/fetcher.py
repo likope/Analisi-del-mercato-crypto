@@ -1,14 +1,13 @@
-import asyncio
-import requests
-import polars as pl
-import time
 import httpx
 
 deribit_url = "https://www.deribit.com/api/v2/public"
-_DERIBIT_CONCURRENCY = 10  # richieste async simultanee — sotto il rate limit Deribit
+_DERIBIT_CONCURRENCY = 10
 
 
 def _with_retry(func, attempts: int = 3, delay: float = 2.0):
+    """
+    Esegue il retry
+    """
     for i in range(attempts):
         try:
             return func()
@@ -20,8 +19,14 @@ def _with_retry(func, attempts: int = 3, delay: float = 2.0):
 
 
 def deribit_get(endpoint: str, params: dict) -> dict:
+    """
+    Esegue la chiamata api a deribit
+    """
     def call():
-        response = requests.get(f"{deribit_url}/{endpoint}", params=params, timeout=10)
+        """
+        Definisce la chiamata
+        """
+        response = httpx.get(f"{deribit_url}/{endpoint}", params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
         if "error" in data:
@@ -31,7 +36,13 @@ def deribit_get(endpoint: str, params: dict) -> dict:
 
 
 def get_binance_spot(symbol: str = "ETHUSDT") -> float:
+    """
+    Esegue la chiamata api a binance per lo spot
+    """
     def call():
+        """
+        Definisce la chiamata
+        """
         r = httpx.get("https://api.binance.com/api/v3/ticker/price",
                       params={"symbol": symbol}, timeout=15)
         r.raise_for_status()
@@ -40,7 +51,13 @@ def get_binance_spot(symbol: str = "ETHUSDT") -> float:
 
 
 def fetch_cvd_spot(symbol: str = "ETHUSDT", interval: str = "1m", limit: int = 100) -> pl.DataFrame:
+    """
+    Esegue la chiamata api a binance per il cvd spot
+    """
     def call():
+        """
+        Definisce la chiamata
+        """
         r = httpx.get("https://api.binance.com/api/v3/klines",
                       params={"symbol": symbol, "interval": interval, "limit": limit},
                       timeout=15)
@@ -63,7 +80,7 @@ def fetch_cvd_spot(symbol: str = "ETHUSDT", interval: str = "1m", limit: int = 1
     return df.with_columns(pl.col("delta").cum_sum().alias("cvd"))
 
 
-async def _fetch_ticker_async(client: httpx.AsyncClient, sem: asyncio.Semaphore,
+    async def _fetch_ticker_async(client: httpx.AsyncClient, sem: asyncio.Semaphore,
                                name: str, strike: float, option_type: str) -> dict | None:
     async with sem:
         for attempt in range(3):
@@ -98,6 +115,9 @@ async def _fetch_ticker_async(client: httpx.AsyncClient, sem: asyncio.Semaphore,
 
 
 async def _fetch_option_async(expiry: str, currency: str) -> pl.DataFrame:
+    """
+    Scarica 10 opzioni alla volta in modo asincrono
+    """
     instruments = deribit_get("get_instruments",
                               {"currency": currency.upper(), "kind": "option", "expired": "false"})
     expiry = expiry.upper()
@@ -121,4 +141,7 @@ async def _fetch_option_async(expiry: str, currency: str) -> pl.DataFrame:
 
 
 def fetch_option(expiry: str, currency: str) -> pl.DataFrame:
+    """
+    Aspetta che il download di opzioni sia finito
+    """
     return asyncio.run(_fetch_option_async(expiry, currency))

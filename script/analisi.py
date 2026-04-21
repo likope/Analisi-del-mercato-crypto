@@ -1,21 +1,13 @@
-import polars as pl
-import csv
-import os
-from datetime import datetime
-from fetcher import get_binance_spot, fetch_option, fetch_cvd_spot
-
-_MAX_HISTORY = 500
-_OI_CHANGE_THRESHOLD_PCT = 0.001  # segnala solo cambi OI > 0.1%
-
-
 def netgex(df, spot: float):
+    """
+    Calcola il netgex e il oi_totale
+    """
     df = df.with_columns(
         pl.when(pl.col("type") == "put")
         .then(pl.lit(-1))
         .otherwise(pl.lit(1))
         .alias("segno")
     ).with_columns(
-        # gamma Deribit è normalizzato per 1% di mossa; 0.01*spot² converte in esposizione dollari
         (pl.col("oi") * pl.col("gamma") * pl.col("segno") * 0.01 * spot**2).alias("Net gex")
     )
     Net_gex = df["Net gex"].sum()
@@ -24,6 +16,9 @@ def netgex(df, spot: float):
 
 
 def walls(df, spot):
+    """
+    Individua i walls e analizza gli oi
+    """
     df2 = df.clone()
     df = (
         df.group_by("strike")
@@ -73,9 +68,9 @@ def iv_skew(df):
     iv_c = calls_25d["iv"].mean()
     skew = iv_p - iv_c
 
-    if skew > 5:
+    if skew > 3:
         signal = "put premium (mercato difensivo)"
-    elif skew < -5:
+    elif skew < -3:
         signal = "call premium (mercato esuberante)"
     else:
         signal = "neutro"
@@ -98,15 +93,6 @@ def cvd_spot(symbol: str = "ETHUSDT", interval: str = "1m", limit: int = 100):
     cvd_current = df["cvd"][-1]
     signal = "BUY pressure" if cvd_current > 0 else "SELL pressure"
     return df, cvd_current, signal
-
-
-def _save_session_row(path: str, row: dict):
-    write_header = not os.path.exists(path)
-    with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=row.keys())
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
 
 
 def ciclo(currency, expiry, spot_accumulo, oi_totale, currency_binance,
@@ -139,7 +125,6 @@ def ciclo(currency, expiry, spot_accumulo, oi_totale, currency_binance,
     print(f"OI totale: {oi_totale_current:.0f}")
     print(f"Netgex: {Netgex:.2f} ({gex_label})")
 
-    # iv_skew e atm_iv vanno calcolati prima di walls() che aggrega df per strike
     skew, iv_put, iv_call, skew_signal = iv_skew(df)
     iv_skew_history.append(skew)
     if skew is not None:
@@ -166,37 +151,6 @@ def ciclo(currency, expiry, spot_accumulo, oi_totale, currency_binance,
 
     print(f"Call walls: {call_walls['strike'].to_list()}")
     print(f"Put walls:  {put_walls['strike'].to_list()}")
-
-    _save_session_row("session_log.csv", {
-        "timestamp": timestamps[-1].isoformat(),
-        "cycle": cycle_num,
-        "spot": spot,
-        "netgex": round(Netgex, 4),
-        "iv_skew": skew if skew is not None else "",
-        "iv_put_25d": iv_put if iv_put is not None else "",
-        "iv_call_25d": iv_call if iv_call is not None else "",
-        "atm_iv": atm_iv,
-        "cvd": round(float(cvd_current), 4),
-        "put_call_ratio": round(put_call_ratio, 4) if put_call_ratio is not None else "",
-        "call_wall_1": call_walls["strike"][0] if len(call_walls) > 0 else "",
-        "call_wall_2": call_walls["strike"][1] if len(call_walls) > 1 else "",
-        "call_wall_3": call_walls["strike"][2] if len(call_walls) > 2 else "",
-        "put_wall_1": put_walls["strike"][0] if len(put_walls) > 0 else "",
-        "put_wall_2": put_walls["strike"][1] if len(put_walls) > 1 else "",
-        "put_wall_3": put_walls["strike"][2] if len(put_walls) > 2 else "",
-        "oi_total": round(oi_totale_current, 0),
-    })
-
-    # Cap su tutte le liste per evitare crescita illimitata in sessioni lunghe
-    spot_accumulo = spot_accumulo[-_MAX_HISTORY:]
-    timestamps = timestamps[-_MAX_HISTORY:]
-    oi_totale = oi_totale[-_MAX_HISTORY:]
-    oi_calls_totale = oi_calls_totale[-_MAX_HISTORY:]
-    oi_puts_totale = oi_puts_totale[-_MAX_HISTORY:]
-    iv_skew_history = iv_skew_history[-_MAX_HISTORY:]
-    atm_iv_history = atm_iv_history[-_MAX_HISTORY:]
-    oi_history = oi_history[-_MAX_HISTORY:]
-    cvd_history = cvd_history[-_MAX_HISTORY:]
 
     return (spot_accumulo, call_walls, put_walls, spot, Netgex, oi_totale_current,
             oi_totale, oi_calls_totale, oi_puts_totale, oi_history, cvd_history,

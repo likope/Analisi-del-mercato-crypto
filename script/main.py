@@ -6,7 +6,6 @@ from plot import plot, plot_oi_profile, plot_cvd, plot_iv_analysis
 print("""Software per l'analisi di mercato.
 Supporta ETH e BTC su Deribit + Binance spot.
 Segnali: Netgex, IV Skew 25d, ATM IV, Gamma Walls, OI, Put/Call ratio, CVD spot.
-Log sessione salvato in session_log.csv.
 Premere Ctrl+C per interrompere.""")
 
 # --- Input con validazione ---
@@ -61,7 +60,7 @@ try:
         plot_iv_analysis(iv_skew_history, atm_iv_history, timestamps)
         time.sleep(60)
 except KeyboardInterrupt:
-    print("\nSessione terminata. Log salvato in session_log.csv.")
+    print("\nSessione terminata.")
 except Exception as e:
     print(f"\nErrore imprevisto: {e}")
     raise
